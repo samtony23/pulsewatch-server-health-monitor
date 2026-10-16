@@ -1,106 +1,141 @@
-import requests
-import time
-import subprocess
-import socket
-import mysql.connector
 import os
+import time
+import socket
+import subprocess
+import requests
+import mysql.connector
 import smtplib
 
 from email.message import EmailMessage
 from dotenv import load_dotenv
 
-
-# -------------------------
-# Load Environment Variables
-# -------------------------
-
 load_dotenv()
 
+# Database configuration
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+DB_NAME = os.getenv("DB_NAME", "health_monitor")
+
+# Email configuration
 EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
 EMAIL_APP_PASSWORD = os.getenv("EMAIL_APP_PASSWORD")
 ALERT_EMAIL = os.getenv("ALERT_EMAIL")
 
-DB_HOST = os.getenv("DB_HOST")
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_NAME = os.getenv("DB_NAME")
+# Monitoring targets
+WEBSITES = [
+    "https://www.google.com",
+    "https://www.github.com",
+    "https://www.amazon.com",
+]
+
+PING_HOSTS = ["google.com"]
+PORT_CHECKS = [("google.com", 443)]
 
 
-# -------------------------
-# MySQL Connection
-# -------------------------
-
-def connect_database():
-
-    connection = mysql.connector.connect(
+def get_db_connection():
+    return mysql.connector.connect(
         host=DB_HOST,
         user=DB_USER,
         password=DB_PASSWORD,
-        database=DB_NAME
+        database=DB_NAME,
+        connection_timeout=10,
     )
 
-    return connection
+
+def save_result(service_name, check_type, status, response_time=None):
+    connection = None
+    cursor = None
+
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            INSERT INTO monitoring_results
+                (service_name, check_type, status, response_time)
+            VALUES (%s, %s, %s, %s)
+            """,
+            (service_name, check_type, status, response_time),
+        )
+
+        connection.commit()
+        print("Result saved to MySQL")
+
+    except mysql.connector.Error as error:
+        print(f"MySQL error while saving result: {error}")
+
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
 
 
-# -------------------------
-# Save Result to MySQL
-# -------------------------
+def update_incident(service_name, check_type, status):
+    connection = None
+    cursor = None
 
-def save_result(service_name, check_type, status, response_time):
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
 
-    connection = connect_database()
-    cursor = connection.cursor()
+        if status == "DOWN":
+            cursor.execute(
+                """
+                SELECT id FROM incidents
+                WHERE service_name = %s
+                  AND check_type = %s
+                  AND status = 'OPEN'
+                LIMIT 1
+                """,
+                (service_name, check_type),
+            )
 
-    query = """
-    INSERT INTO monitoring_results
-    (service_name, check_type, status, response_time)
-    VALUES (%s, %s, %s, %s)
-    """
+            if cursor.fetchone() is None:
+                cursor.execute(
+                    """
+                    INSERT INTO incidents
+                        (service_name, check_type, status)
+                    VALUES (%s, %s, 'OPEN')
+                    """,
+                    (service_name, check_type),
+                )
+                connection.commit()
+                send_email_alert(service_name, check_type)
 
-    values = (
-        service_name,
-        check_type,
-        status,
-        response_time
-    )
+        else:
+            cursor.execute(
+                """
+                UPDATE incidents
+                SET status = 'RESOLVED',
+                    resolved_at = CURRENT_TIMESTAMP
+                WHERE service_name = %s
+                  AND check_type = %s
+                  AND status = 'OPEN'
+                """,
+                (service_name, check_type),
+            )
+            connection.commit()
 
-    cursor.execute(query, values)
-    connection.commit()
+    except mysql.connector.Error as error:
+        print(f"Incident tracking error: {error}")
 
-    cursor.close()
-    connection.close()
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
 
-    print("Result saved to MySQL")
-
-
-# -------------------------
-# Terminal Alert
-# -------------------------
-
-def send_alert(service_name, check_type):
-
-    print()
-    print("===================================")
-    print("          ALERT")
-    print("Service:", service_name)
-    print("Check Type:", check_type)
-    print("Status: DOWN")
-    print("===================================")
-    print()
-
-
-# -------------------------
-# Email Alert
-# -------------------------
 
 def send_email_alert(service_name, check_type):
+    if not EMAIL_ADDRESS or not EMAIL_APP_PASSWORD or not ALERT_EMAIL:
+        print("Email alert skipped: email configuration is missing.")
+        return False
 
     message = EmailMessage()
-
-    message["Subject"] = (
-        f"PulseWatch Alert: {service_name} is DOWN"
-    )
-
+    message["Subject"] = f"PulseWatch Alert: {service_name} is DOWN"
     message["From"] = EMAIL_ADDRESS
     message["To"] = ALERT_EMAIL
 
@@ -116,264 +151,107 @@ Please check the service immediately.
     )
 
     try:
-
         with smtplib.SMTP_SSL(
-            "smtp.gmail.com",
-            465
+            "smtp.gmail.com", 465, timeout=15
         ) as server:
-
-            server.login(
-                EMAIL_ADDRESS,
-                EMAIL_APP_PASSWORD
-            )
-
+            server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
             server.send_message(message)
 
-        print("Email alert sent successfully.")
+        print(f"Email alert sent for {service_name}.")
+        return True
 
     except Exception as error:
+        print(f"Email alert failed: {error}")
+        return False
 
-        print("Email alert failed:", error)
-
-
-# -------------------------
-# Website HTTP Check
-# -------------------------
 
 def check_website(url):
+    start_time = time.perf_counter()
+    status = "DOWN"
+    response_time = None
 
     try:
+        response = requests.get(url, timeout=10)
+        response_time = time.perf_counter() - start_time
+        status = "UP" if response.status_code < 400 else "DOWN"
 
-        start_time = time.time()
+        print(f"Website: {url}")
+        print(f"Status: {status}")
+        print(f"Status Code: {response.status_code}")
+        print(f"Response Time: {response_time:.2f} seconds")
 
-        response = requests.get(
-            url,
-            timeout=5
-        )
+    except requests.RequestException as error:
+        print(f"Website: {url}")
+        print(f"Status: DOWN")
+        print(f"Request error: {error}")
 
-        end_time = time.time()
+    save_result(url, "HTTP", status, response_time)
+    update_incident(url, "HTTP", status)
 
-        response_time = end_time - start_time
-
-        if response.status_code == 200:
-
-            status = "UP"
-
-        else:
-
-            status = "DOWN"
-
-
-        print("Website:", url)
-        print("Status:", status)
-        print("Status Code:", response.status_code)
-        print(
-            "Response Time:",
-            round(response_time, 2),
-            "seconds"
-        )
-
-
-        save_result(
-            url,
-            "HTTP",
-            status,
-            response_time
-        )
-
-
-        # Send alerts if website is DOWN
-
-        if status == "DOWN":
-
-            send_alert(
-                url,
-                "HTTP"
-            )
-
-            send_email_alert(
-                url,
-                "HTTP"
-            )
-
-
-        print("-------------------------")
-
-
-    except requests.exceptions.RequestException:
-
-        print("Website:", url)
-        print("Status: DOWN")
-        print("Reason: Website is not reachable")
-
-
-        save_result(
-            url,
-            "HTTP",
-            "DOWN",
-            None
-        )
-
-
-        # Send alerts
-
-        send_alert(
-            url,
-            "HTTP"
-        )
-
-        send_email_alert(
-            url,
-            "HTTP"
-        )
-
-
-        print("-------------------------")
-
-
-# -------------------------
-# Websites to Monitor
-# -------------------------
-
-websites = [
-
-    "https://www.google.com",
-    "https://www.github.com",
-    "https://www.amazon.com"
-
-]
-
-
-for url in websites:
-
-    check_website(url)
-
-
-# -------------------------
-# Ping Check
-# -------------------------
 
 def check_ping(host):
-
-    result = subprocess.run(
-        ["ping", "-n", "1", host],
-        capture_output=True,
-        text=True
-    )
-
-
-    if result.returncode == 0:
-
-        status = "UP"
-
-    else:
-
-        status = "DOWN"
-
-
-    print("Host:", host)
-    print("Ping Status:", status)
-
-
-    save_result(
-        host,
-        "PING",
-        status,
-        None
-    )
-
-
-    # Send alerts if ping is DOWN
-
-    if status == "DOWN":
-
-        send_alert(
-            host,
-            "PING"
-        )
-
-        send_email_alert(
-            host,
-            "PING"
-        )
-
-
-    print("-------------------------")
-
-
-check_ping("google.com")
-
-
-# -------------------------
-# Port Check
-# -------------------------
-
-def check_port(host, port):
+    start_time = time.perf_counter()
 
     try:
-
-        sock = socket.socket(
-            socket.AF_INET,
-            socket.SOCK_STREAM
+        result = subprocess.run(
+            ["ping", "-c", "1", "-W", "3", host],
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
+        status = "UP" if result.returncode == 0 else "DOWN"
 
-        sock.settimeout(3)
+    except (subprocess.SubprocessError, OSError):
+        status = "DOWN"
 
+    response_time = (
+        time.perf_counter() - start_time if status == "UP" else None
+    )
 
-        result = sock.connect_ex(
-            (host, port)
-        )
+    print(f"Host: {host}")
+    print(f"Ping Status: {status}")
 
-
-        if result == 0:
-
-            status = "OPEN"
-
-        else:
-
-            status = "CLOSED"
+    save_result(host, "PING", status, response_time)
+    update_incident(host, "PING", status)
 
 
-        print("Host:", host)
-        print("Port:", port)
-        print("Port Status:", status)
+def check_port(host, port):
+    start_time = time.perf_counter()
+
+    try:
+        with socket.create_connection((host, port), timeout=5):
+            status = "UP"
+            response_time = time.perf_counter() - start_time
+
+    except (OSError, TimeoutError):
+        status = "DOWN"
+        response_time = None
+
+    print(f"Host: {host}")
+    print(f"Port: {port}")
+    print(f"Port Status: {'OPEN' if status == 'UP' else 'CLOSED'}")
+
+    save_result(f"{host}:{port}", "PORT", status, response_time)
+    update_incident(f"{host}:{port}", "PORT", status)
 
 
-        save_result(
-            host,
-            "PORT",
-            status,
-            None
-        )
+def run_checks():
+    print("\n========== PulseWatch Monitoring ==========\n")
+
+    for url in WEBSITES:
+        check_website(url)
+        print("-------------------------")
+
+    for host in PING_HOSTS:
+        check_ping(host)
+        print("-------------------------")
+
+    for host, port in PORT_CHECKS:
+        check_port(host, port)
+        print("-------------------------")
+
+    print("\nMonitoring checks completed.")
 
 
-        # Send alerts if port is CLOSED
-
-        if status == "CLOSED":
-
-            send_alert(
-                host,
-                "PORT"
-            )
-
-            send_email_alert(
-                host,
-                "PORT"
-            )
-
-
-        sock.close()
-
-
-    except socket.error:
-
-        print("Unable to check the port.")
-
-
-    print("-------------------------")
-
-
-check_port(
-    "google.com",
-    443
-)
+if __name__ == "__main__":
+    run_checks()
